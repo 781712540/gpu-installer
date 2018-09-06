@@ -1,13 +1,14 @@
 #!/bin/bash
 # nvidia gpu auto installer
 # centos 7.X, ubuntu 16.04+ are supported
+set -e
+set -u
+
 NVIDIA_DIR=/var/IEF/nvidia
 KERNEL_VERSION=$(uname -r)
 
-mkdir -p "${NVIDIA_DIR}/build"
-cd "$NVIDIA_DIR/build"
-set -e
-set -u
+mkdir -p "$NVIDIA_DIR"
+cd "$NVIDIA_DIR"
 
 # TODO: find the most proper nvidia-driver version
 NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-384.111}"
@@ -16,30 +17,10 @@ NVIDIA_DRIVER_DOWNLOAD_URL_DEFAULT="https://us.download.nvidia.com/tesla/${NVIDI
 NVIDIA_DRIVER_DOWNLOAD_URL="${NVIDIA_DRIVER_DOWNLOAD_URL:-$NVIDIA_DRIVER_DOWNLOAD_URL_DEFAULT}"
 NVIDIA_INSTALLER_RUNFILE="$(basename "${NVIDIA_DRIVER_DOWNLOAD_URL}")"
 
-
-get_url()
+get_release()
 {
-  echo "${NVIDIA_DRIVER_DOWNLOAD_URL//$NVIDIA_DRIVER_VERSION/$1}"
+  eval "$(sed 's/^[A-Za-z]/OS_&/' /etc/os-release)"
 }
-
-uninstall()
-{
-  # 
-  # TODO: need to help uninstall the driver if not installed by this method?
-  # TODO: found a way to figure out installed by this method
-  version=$(modinfo nvidia | awk '/^version/{print $2}')
-  if [ -n "$version" ]; then
-    url=$(get_url $version)
-    installer_file=$(basename ${url})
-    [ -f "$installer_file" ] || curl -L -S -f "${url}" -o "$installer_file"
-    bash $installer_file --uninstall --silent || return 1
-      
-  else
-    echo "Can't found current nvidia version"
-    return 1
-  fi
-}
-
 
 pre_check()
 {
@@ -49,17 +30,19 @@ pre_check()
   fi
 
   if ! lspci | grep -i NVIDIA | grep -qe '3D controller' -e 'VGA compatible controller'; then
-    echo "NVIDIA Card not found"
-    return 1
+    [ -z "${__DEBUG__:-}" ] && {
+      echo "NVIDIA Card not found"
+      return 1
+    }
   fi
 
-  if lsmod |grep -q nvidia; then
+  if check_drivers_exist; then
     echo "NVIDIA kernel driver already installed and loaded! Need to uninstall it first!"
-    read -p "Are you sure to uninstall it:[yN]" choice
-    if [ "$choice" = y -o "$choice" = Y ] ; then
-      uninstall || { echo "You need to uninstall it manully"; return 1; }
+    [ -z "$uninstall_choice" ] && read -p "Are you sure to uninstall it? [yN] " uninstall_choice
+    if [ "$uninstall_choice" = y -o "$uninstall_choice" = Y ] ; then
+      uninstall_drivers || return 1
     else
-      { echo "You need to uninstall nvidia drivers first"; return 1; }
+      { echo "Abort!"; return 1; }
     fi
   fi
 
@@ -69,20 +52,89 @@ pre_check()
   fi
 }
 
-dev_ubuntu()
+get_url()
 {
-    echo "RUN apt-get update && \
+  echo "${NVIDIA_DRIVER_DOWNLOAD_URL//$NVIDIA_DRIVER_VERSION/$1}"
+}
+
+download_nvidia_installer()
+{
+  
+  url="${1:-$NVIDIA_DRIVER_DOWNLOAD_URL}"
+  savefile="${2:-$NVIDIA_INSTALLER_RUNFILE}"
+  # TODO: checksum in case installer is broken
+  if [ ! -f "${savefile}" ]; then
+    echo "Downloading Nvidia installer..."
+    curl -L -S -f "${url}" -o "${savefile}"
+    echo "Downloading Nvidia installer... DONE."
+  else
+    echo "Nvidia installer cached in ${PWD}/${savefile}"
+  fi
+}
+
+check_drivers_exist()
+{
+  [ -n "${__DEBUG__:-}" ] && return 0
+  lsmod | grep -qw nvidia
+}
+
+unload_drivers()
+{
+  for m in nvidia_uvm nvidia_modeset nvidia; do
+    rmmod $m 2>/dev/null || modprobe -rf $m 2>/dev/null || true
+  done
+  ! check_drivers_exist
+}
+
+uninstall_drivers()
+{
+  if ! check_drivers_exist; then
+    echo "nvidia.ko not inserted, don't need to uninstall!"
+    return 0
+  fi
+  # 
+  # TODO: need to help uninstall the driver if not installed by this method?
+  # TODO: found a way to figure out installed by this method
+  version=$(modinfo nvidia 2>/dev/null| awk '/^version/{print $2}')
+  if [ -z "$version" ]; then
+    echo "WARNING: Can't found current nvidia version"
+    echo "first try to rmmod only"
+    unload_drivers && return 0
+    echo "second try to use $NVIDIA_DRIVER_VERSION to uninstall"
+    version=$NVIDIA_DRIVER_VERSION
+  fi
+  url="$(get_url $version)"
+  installer_file=$(basename "${url}")
+  download_nvidia_installer "$url" "$installer_file"
+  bash "$installer_file" --uninstall --silent || true
+  # last to check
+  if check_drivers_exist; then
+    echo "failed to uninstall nvidia driver!"
+    [ -n "${__DEBUG__:-}" ] && return 0
+    return 1
+  fi
+}
+
+uninstall()
+{
+  uninstall_drivers 
+  rm -f /etc/systemd/system/nvidia-drivers-loader.service /etc/ld.so.conf.d/nvidia-drivers.conf 
+}
+
+clean()
+{
+  unload_drivers || true
+  find "$NVIDIA_DIR" -maxdepth 2 -type f -delete
+  find "$NVIDIA_DIR" -maxdepth 2 -type d -delete
+  rmdir "$NVIDIA_DIR"
+}
+
+
+install_devel_ubuntu()
+{
+    echo "apt-get update && \
     apt-get install -y kmod gcc make curl && \
     rm -rf /var/lib/apt/lists/*"
-}
-
-dev_centos()
-{
-    echo "RUN yum update -y && yum install gcc make curl -y"
-}
-
-download_kernel_ubuntu()
-{
     echo "apt-get update && apt-get install -y linux-headers-${KERNEL_VERSION}"
 }
 
@@ -92,13 +144,14 @@ installer_extra_args_ubuntu()
 }
 
 
-download_kernel_centos()
+install_devel_centos()
 {
    
+  echo "yum update -y && yum install gcc make curl -y"
    # TODO: report error when kernel-devel version does not match current kernel version
   echo '
    if [ ! -d {ROOT_MOUNT_DIR}/usr/src/kernels/$KERNEL_VERSION ] ; then
-        yum update -y && yum install -y kernel-devel kernel-headers 
+      yum update -y && yum install -y kernel-devel kernel-headers 
    fi
    '
 }
@@ -106,23 +159,6 @@ download_kernel_centos()
 installer_extra_args_centos()
 {
     echo '--kernel-source-path ${ROOT_MOUNT_DIR}/usr/src/kernels/$KERNEL_VERSION'
-}
-
-
-build_image()
-{
-  cat > Dockerfile <<EOF
-FROM ${OS_ID}:${OS_VERSION_ID}
-
-EOF
-
-  cat >> Dockerfile <<EOF
-
-$(dev_${OS_ID})
-COPY entrypoint.sh /entrypoint.sh
-CMD /entrypoint.sh
-EOF
-  docker build -t "$1" .
 }
 
 gen_entrypoint()
@@ -193,10 +229,10 @@ update_container_ld_cache() {
   echo "Updating container's ld cache... DONE."
 }
 
-download_kernel_src() {
-  echo "Downloading kernel sources..."
-  {{download_kernel}}
-  echo "Downloading kernel sources... DONE."
+install_devel() {
+  echo "Install development tools and downloading kernel sources..."
+  {{install_devel}}
+  echo "Install development tools and downloading kernel sources... DONE."
 }
 
 configure_nvidia_installation_dirs() {
@@ -285,14 +321,59 @@ verify_nvidia_installation() {
 
 update_host_ld_cache() {
   echo "Updating host's ld cache..."
-  echo "${NVIDIA_INSTALL_DIR_HOST}/lib64" >> "${ROOT_MOUNT_DIR}/etc/ld.so.conf"
+  mkdir -p "${ROOT_MOUNT_DIR}/etc/ld.so.conf.d"
+  echo "${NVIDIA_INSTALL_DIR_HOST}/lib64" >> "${ROOT_MOUNT_DIR}/etc/ld.so.conf.d/nvidia-drivers.conf"
   ldconfig -r "${ROOT_MOUNT_DIR}"
   echo "Updating host's ld cache... DONE."
 }
 
-install_nvidia_loader_service() {
+main() {
+  if check_cached_version; then
+    configure_cached_installation
+    verify_nvidia_installation
+  else
+    install_devel
+    configure_nvidia_installation_dirs
+    run_nvidia_installer
+    update_cached_version
+    verify_nvidia_installation
+  fi
+  update_host_ld_cache
+  install_nvidia_loader_service
+}
 
-  pushd $NVIDIA_INSTALL_DIR_CONTAINER
+main "$@"
+
+EOL
+)
+
+  for t in install_devel installer_extra_args; do
+    pat="{{"$t"}}"
+    v="$(eval ${t}_${OS_ID})"
+    templ="${templ/$pat/$v}"
+  done
+  echo "$templ" > $1
+  chmod +x $1
+}
+
+build_image()
+{
+  mkdir -p "${NVIDIA_DIR}/.build"
+  pushd "${NVIDIA_DIR}/.build"
+
+  entrypoint=entrypoint.sh
+  gen_entrypoint $entrypoint
+  cat > Dockerfile <<EOF
+FROM ${OS_ID}:${OS_VERSION_ID}
+COPY $entrypoint /$entrypoint
+CMD /$entrypoint
+EOF
+  docker build -t "$1" .
+  popd
+}
+
+install_drivers_loader_service() 
+{
 
   cat <<-"EOF" > nvidia-drivers-loader.sh
 #!/bin/bash
@@ -314,7 +395,7 @@ EOF
 
   chmod +x nvidia-drivers-loader.sh
 
-  cat <<-EOF > ${ROOT_MOUNT_DIR}/etc/systemd/system/nvidia-drivers-loader.service
+  cat <<-EOF > /etc/systemd/system/nvidia-drivers-loader.service
 [Unit]
 Description=auto loader of nvidia drivers
 Before=local-fs.target
@@ -323,7 +404,7 @@ Conflicts=shutdown.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash $NVIDIA_INSTALL_DIR_HOST/nvidia-drivers-loader.sh
+ExecStart=/bin/bash ${PWD}/nvidia-drivers-loader.sh
 RemainAfterExit=yes
 Environment="PATH=/usr/sbin:/sbin:/usr/bin:/bin"
 
@@ -331,56 +412,9 @@ Environment="PATH=/usr/sbin:/sbin:/usr/bin:/bin"
 WantedBy=sysinit.target
 EOF
 
-  chroot ${ROOT_MOUNT_DIR} systemctl enable nvidia-drivers-loader.service
-  popd
+  systemctl enable nvidia-drivers-loader.service
 }
 
-main() {
-  if check_cached_version; then
-    configure_cached_installation
-    verify_nvidia_installation
-  else
-    download_kernel_src
-    configure_nvidia_installation_dirs
-    run_nvidia_installer
-    update_cached_version
-    verify_nvidia_installation
-  fi
-  update_host_ld_cache
-  install_nvidia_loader_service
-}
-
-main "$@"
-
-EOL
-)
-
-  for t in download_kernel installer_extra_args; do
-    pat="{{"$t"}}"
-    v="$(eval ${t}_${OS_ID})"
-    templ="${templ/$pat/$v}"
-  done
-  echo "$templ" > entrypoint.sh
-  chmod +x entrypoint.sh
-}
-
-get_release()
-{
-  eval "$(sed 's/^[A-Za-z]/OS_&/' /etc/os-release)"
-}
-
-download_nvidia_installer() {
-  # TODO: checksum in case installer broken
-  pushd "${NVIDIA_DIR}"
-  if [ ! -f "${NVIDIA_INSTALLER_RUNFILE}" ]; then
-    echo "Downloading Nvidia installer..."
-    curl -L -S -f "${NVIDIA_DRIVER_DOWNLOAD_URL}" -o "${NVIDIA_INSTALLER_RUNFILE}"
-    echo "Downloading Nvidia installer... DONE."
-  else
-    echo "Nvidia installer cached in ${PWD}/${NVIDIA_INSTALLER_RUNFILE}"
-  fi
-  popd
-}
 
 pre_run()
 {
@@ -389,20 +423,27 @@ pre_run()
   download_nvidia_installer
 }
 
+post_run()
+{
+  install_drivers_loader_service
+}
+
 run_installer()
 {
   pre_run
-  gen_entrypoint
   image_name=${OS_ID}-nvidia-driver-installer:latest
 
   build_image $image_name
 
   # build extra args
   extra_args=""
+  [ -n "${__DEBUG__:-}" ] && extra_args="--entrypoint /bin/bash"
   [ -n "${http_proxy:-}" ] && extra_args="$extra_args -e http_proxy=$http_proxy"
   [ -n "${https_proxy:-}" ] && extra_args="$extra_args -e https_proxy=$https_proxy"
+  [ -n "${no_proxy:-}" ] && extra_args="$extra_args -e no_proxy=$no_proxy"
+  run_cmd=""
+  [ -n "${__DEBUG__:-}" ] && run_cmd="-c /entrypoint.sh||/bin/bash&&false" 
 
-  # TODO: find the most proper nvidia-driver version
   docker run --rm -it --privileged --net=host -v /dev:/dev \
     -v $NVIDIA_DIR:$NVIDIA_DIR -v /:/root \
     -e NVIDIA_INSTALL_DIR_HOST=$NVIDIA_DIR \
@@ -411,7 +452,7 @@ run_installer()
     -e NVIDIA_DRIVER_VERSION=${NVIDIA_DRIVER_VERSION} \
     -e NVIDIA_INSTALLER_RUNFILE=${NVIDIA_INSTALLER_RUNFILE} \
     $extra_args \
-    $image_name
+    $image_name $run_cmd && post_run
 }
 
 post_check()
@@ -420,9 +461,49 @@ post_check()
   return 0
 }
 
-get_release
+install()
+{
+  get_release
+  opt=${1:-}
+  uninstall_choice=
+  case "$opt" in
+    -y|--uninstall-yes) uninstall_choice=y;;
+    *) :;;
+  esac
 
-if pre_check; then
-  run_installer && post_check
-fi
+  if pre_check; then
+    if run_installer && post_check; then
+      echo "Nvidia $NVIDIA_DRIVER_VERSION is installed at ${NVIDIA_DIR}, successfully"
+      echo "nvidia-smi is located in ${NVIDIA_DIR}/bin, you can add ${NVIDIA_DIR}/bin into PATH in your shell profile!"
+    else
+      echo "Failed to install nvidia $NVIDIA_DRIVER_VERSION!"
+    fi
+  fi
+}
+
+usage()
+{
+  echo "Usage: $(basename $0) COMMAND options"
+  echo "Supported environment variables:"
+  echo "   NVIDIA_DRIVER_VERSION => version to be installed"
+  echo "   NVIDIA_DRIVER_DOWNLOAD_URL => driver download url"
+  echo "   http_proxy, https_proxy, no_proxy => proxy"
+  echo
+  echo "Commands:"
+  echo "   install: install nvidia drivers"
+  echo "           -y|--uninstall-yes: try to uninstall drivers if exists"
+  echo "   uninstall: uninstall nvidia drivers"
+  echo "   clean: clean up all files added by this script"
+  exit ${1:-1}
+}
+
+# default cmd is install
+[ $# -eq 0 ] && set install
+cmd=$1
+shift 1
+case "$cmd" in
+  install|uninstall|clean) $cmd "$@";;
+  -h|help) usage 0;;
+  *) usage 1;;
+esac
 
